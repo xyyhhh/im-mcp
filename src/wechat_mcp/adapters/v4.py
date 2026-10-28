@@ -17,6 +17,8 @@ import sqlite3
 import hashlib
 import logging
 from pathlib import Path
+from ..sources import DiskSource
+from .upsert import upsert
 from typing import Dict
 
 from ..parser import build_content, extract_emoticon_md5
@@ -37,17 +39,18 @@ def is_v4_layout(decrypted_dir: Path) -> bool:
     return any(p.exists() for p in patterns)
 
 
-def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor, source=None) -> None:
     """执行绿泡泡 4.x 数据库同步"""
     # 1. 联系人与群成员解析
+    source = source or DiskSource()
     contact_dir = decrypted_dir / "contact"
-    if not contact_dir.exists():
+    if not source.exists(contact_dir):
         contact_dir = decrypted_dir / "db_storage" / "contact"
 
-    if contact_dir.exists():
-        for db_file in contact_dir.glob("*.db"):
+    if source.exists(contact_dir):
+        for db_file in source.files(contact_dir):
             try:
-                c_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+                c_conn = source.connect(db_file)
                 c_conn.row_factory = sqlite3.Row
                 tables = [r[0] for r in c_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
                 if "contact" in tables:
@@ -61,10 +64,7 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                             # username 是 contacts 主键，NULL 会绕过 UNIQUE 去重并逐次累积
                             continue
                         disp = r["remark"] or r["nick_name"] or r["alias"] or uname
-                        cur.execute("""
-                            INSERT OR REPLACE INTO contacts (username, alias, display_name, type)
-                            VALUES (?, ?, ?, ?)
-                        """, (uname, r["alias"], disp, r["local_type"] or 0))
+                        upsert(cur, 'contacts', ('username', 'alias', 'display_name', 'type'), ('username',), ('?', '?', '?', '?'), (uname, r["alias"], disp, r["local_type"] or 0))
 
                 # 群成员解析 (4.x 使用 chatroom_member + chat_room + name2id)
                 if "chatroom_member" in tables and "chat_room" in tables and "name2id" in tables:
@@ -77,34 +77,32 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                         """
                         for r in c_conn.execute(sql):
                             if r["room_name"] and r["member_name"]:
-                                cur.execute("""
-                                    INSERT OR REPLACE INTO chatroom_members (chatroom_username, member_username, display_name)
-                                    VALUES (?, ?, ?)
-                                """, (r["room_name"], r["member_name"], ""))
+                                upsert(cur, 'chatroom_members', ('chatroom_username', 'member_username', 'display_name'), ('chatroom_username', 'member_username'), ('?', '?', '?'), (r["room_name"], r["member_name"], ""))
                     except Exception as err:
+                        if source.strict:
+                            raise
                         logger.debug(f"Error parsing 4.x chatroom_member: {err}")
                 elif "chat_room" in tables:
                     cols = [r[1] for r in c_conn.execute("PRAGMA table_info(chat_room)").fetchall()]
                     if "chat_room_name" in cols and "user_name" in cols:
                         for r in c_conn.execute("SELECT chat_room_name, user_name, display_name FROM chat_room"):
                             if r["chat_room_name"] and r["user_name"]:
-                                cur.execute("""
-                                    INSERT OR REPLACE INTO chatroom_members (chatroom_username, member_username, display_name)
-                                    VALUES (?, ?, ?)
-                                """, (r["chat_room_name"], r["user_name"], r["display_name"]))
+                                upsert(cur, 'chatroom_members', ('chatroom_username', 'member_username', 'display_name'), ('chatroom_username', 'member_username'), ('?', '?', '?'), (r["chat_room_name"], r["user_name"], r["display_name"]))
                 c_conn.close()
             except Exception as e:
+                if source.strict:
+                    raise
                 logger.warning(f"Error parsing contact db {db_file}: {e}")
 
     # 2. 会话解析
     session_dir = decrypted_dir / "session"
-    if not session_dir.exists():
+    if not source.exists(session_dir):
         session_dir = decrypted_dir / "db_storage" / "session"
 
-    if session_dir.exists():
-        for db_file in session_dir.glob("*.db"):
+    if source.exists(session_dir):
+        for db_file in source.files(session_dir):
             try:
-                s_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+                s_conn = source.connect(db_file)
                 s_conn.row_factory = sqlite3.Row
                 cols = [r[1] for r in s_conn.execute("PRAGMA table_info(SessionTable)").fetchall()]
                 time_col = "last_timestamp" if "last_timestamp" in cols else ("last_time" if "last_time" in cols else "0")
@@ -125,27 +123,26 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     stype = "room" if "@chatroom" in uname or "@openim" in uname else ("gh" if uname.startswith("gh_") else "c2c")
                     dname = name_by_user.get(uname) or uname
 
-                    cur.execute("""
-                        INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview, unread)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (uname, stype, dname, r["last_time"], r["summary"], int(r["unread"] or 0)))
+                    upsert(cur, 'sessions', ('username', 'type', 'display_name', 'last_time', 'last_msg_preview', 'unread'), ('username',), ('?', '?', '?', '?', '?', '?'), (uname, stype, dname, r["last_time"], r["summary"], int(r["unread"] or 0)))
                 s_conn.close()
             except Exception as e:
+                if source.strict:
+                    raise
                 logger.warning(f"Error parsing session db {db_file}: {e}")
 
     # 3. 消息解析
     msg_dir = decrypted_dir / "message"
-    if not msg_dir.exists():
+    if not source.exists(msg_dir):
         msg_dir = decrypted_dir / "db_storage" / "message"
 
-    if msg_dir.exists():
+    if source.exists(msg_dir):
         # 微信 4.x 的消息库不止 message_*.db：biz_message_*.db（服务号/公众号等）
         # 同样存放 Msg_<md5> 消息表（本机实测 189 张表 / 5191 条消息）。原先只
         # glob message_*.db 会整库漏掉。改为遍历目录下全部 .db，由内部的 Msg_
         # 表探测决定是否真有消息，将来新增分片也能自动覆盖。
-        for db_file in sorted(msg_dir.glob("*.db")):
+        for db_file in sorted(source.files(msg_dir)):
             try:
-                m_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+                m_conn = source.connect(db_file)
                 m_conn.row_factory = sqlite3.Row
 
                 # 先看这个库到底有没有消息表；没有就直接跳过（media_0.db /
@@ -166,6 +163,8 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                             h = hashlib.md5(uname.encode("utf-8")).hexdigest()
                             hash_to_user[h] = uname
                 except sqlite3.Error as exc:
+                    if source.strict:
+                        raise
                     # Name2Id 读失败会让会话键从「真实用户名」退化成「chat_<表哈希>」，
                     # 与上一次成功的 ETL 不一致，同一条消息会以两个键各存一份。
                     # 直接跳过该库等下次 ETL 重试，避免写入不稳定的键。
@@ -207,18 +206,10 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                         # 而 recursive_triggers 默认关闭，AFTER DELETE 触发器不会触发，
                         # messages_fts 会残留旧词条；且新行会拿到新的自增 id，导致主键
                         # 每次 ETL 都漂移、索引无界膨胀。UPSERT 原地更新，rowid 稳定。
-                        cur.execute("""
-                            INSERT INTO messages
-                            (source_file, local_id, session_username, sender_username, create_time, local_type, content, emoticon_md5)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(source_file, session_username, local_id) DO UPDATE SET
-                                sender_username = excluded.sender_username,
-                                create_time     = excluded.create_time,
-                                local_type      = excluded.local_type,
-                                content         = excluded.content,
-                                emoticon_md5    = excluded.emoticon_md5
-                        """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content, emoticon_md5))
+                        upsert(cur, 'messages', ('source_file', 'local_id', 'session_username', 'sender_username', 'create_time', 'local_type', 'content', 'emoticon_md5'), ('source_file', 'session_username', 'local_id'), ('?', '?', '?', '?', '?', '?', '?', '?'), (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content, emoticon_md5))
 
                 m_conn.close()
             except Exception as e:
+                if source.strict:
+                    raise
                 logger.warning(f"Error parsing message db {db_file}: {e}")

@@ -74,3 +74,6 @@ all_keys.json
 # 本地参考项目（不上传远程）
 reference/
 reference/*
+
+# Isolated development profiles (never publish runtime data)
+.test-profile*/

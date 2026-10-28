@@ -1,5 +1,7 @@
 # im-mcp (本地绿泡泡 & DuangDuang AI 检索 MCP Server)
 
+本 fork 的可选常驻内存同步与下游事件接口见 [常驻同步说明](docs/resident-sync.md)。
+
 基于 **Model Context Protocol (MCP)** 规范构建的本地 IM（绿泡泡 & DuangDuang）聊天记录与通讯录检索服务。
 极简、只读、完全离线本地运行，让 Claude Desktop、Cursor、Cline、Pi 等 AI Agent 能够安全、高速地检索与总结你的工作沟通、群聊记录和知识库。
 

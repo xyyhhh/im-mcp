@@ -259,6 +259,7 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     Returns dictionary with image path, metadata, and optional base64 content.
     """
     import sqlite3
+    from .sources import source_exists, connect_source
     from .database import get_connection
 
     conn = get_connection()
@@ -283,9 +284,9 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     
     # Attempt A: Check message_resource.db
     res_db = decrypted_dir / "message" / "message_resource.db"
-    if res_db.exists():
+    if source_exists(res_db):
         try:
-            r_conn = sqlite3.connect(res_db)
+            r_conn = connect_source(res_db)
             r_cur = r_conn.cursor()
             res_row = r_cur.execute(
                 "SELECT packed_info FROM MessageResourceInfo WHERE message_create_time = ? AND message_local_id = ?",
@@ -302,9 +303,9 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     # Attempt B: Check specific Msg table if target_md5 still not found
     if not target_md5 and source_file:
         src_db = decrypted_dir / "message" / source_file
-        if src_db.exists():
+        if source_exists(src_db):
             try:
-                s_conn = sqlite3.connect(src_db)
+                s_conn = connect_source(src_db)
                 s_cur = s_conn.cursor()
                 # Find matching table
                 tables = [r[0] for r in s_cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() if r[0].startswith("Msg_")]

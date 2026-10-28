@@ -32,6 +32,7 @@ from typing import Any, Dict, Optional
 
 from .config import USER_WECHAT_DIR, get_decrypted_dir
 from .database import sync_data
+from . import low_write
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,10 @@ SYNC_HEARTBEAT_STALE_SECONDS = 90
 # 终止其子进程），start_sync 会清理残留并返回 started=false，让调用方回退阻塞同步。
 WORKER_STARTUP_GRACE_SECONDS = 3.0
 _lock = threading.RLock()
+_resident_last_run = None
+_resident_run_count = 0
+_resident_trigger_mode = None
+_resident_last_check_at = None
 
 
 # ------------------------------------------------------------------
@@ -168,6 +173,8 @@ def refresh_decrypted(db_dir: Optional[str] = None,
 
 def refresh_and_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
     """执行一次完整同步，返回两步各自的结果。"""
+    if low_write.enabled():
+        return low_write.sync_memory(force=force, redecrypt=redecrypt)
     out: Dict[str, Any] = {}
     if redecrypt:
         refresh = refresh_decrypted()
@@ -214,12 +221,23 @@ def _save_state(state: Dict[str, Any]) -> None:
 
 def record_run(result: Dict[str, Any], started_at: float) -> Dict[str, Any]:
     """把一次同步结果写入 auto_sync.json（独立进程与进程内线程共用）。"""
+    global _resident_last_run, _resident_run_count, _resident_last_check_at
     record = {
         "at": int(time.time()),
         "duration_seconds": round(time.time() - started_at, 1),
         "ok": bool(result.get("ok")),
         "result": result,
     }
+    if low_write.enabled():
+        _resident_last_check_at = record["at"]
+        previous = _resident_last_run
+        # Idle checks and repeated identical errors live only in memory.
+        if result.get("etl_step", {}).get("status") in ("skipped", "busy"):
+            return record
+        _resident_run_count += 1
+        _resident_last_run = record
+        if previous and previous.get("result") == result:
+            return record
     with _lock:
         state = _load_state()
         state["last_run"] = record
@@ -328,20 +346,48 @@ def _clamp_interval(minutes: Any) -> int:
     return max(MIN_INTERVAL_MINUTES, min(MAX_INTERVAL_MINUTES, m))
 
 
-def _loop(interval_seconds: int) -> None:
-    # Event.wait 可被 stop() 立即打断，避免 stop 后还要等满一个间隔
-    while not _stop_event.wait(interval_seconds):
+def _loop(interval_seconds: int, stop_event=None) -> None:
+    global _resident_trigger_mode
+    stop = stop_event if stop_event is not None else _stop_event
+    if not low_write.enabled():
+        while not stop.wait(interval_seconds):
+            try:
+                _run_once()
+            except Exception as exc:
+                logger.warning(f"定时同步失败：{exc}")
+        return
+    from .change_watch import ChangeWatch
+    keys = USER_WECHAT_DIR / "all_keys.json"
+    directory = os.environ.get("WECHAT_DB_DIR") or _db_dir_from_keys(keys)
+    watch = ChangeWatch(directory or USER_WECHAT_DIR, keys)
+    try:
         try:
-            _run_once()
-        except Exception as exc:  # noqa: BLE001 - 定时任务不能因单次异常而退出
-            logger.warning(f"定时同步失败：{exc}")
+            watch.start()
+        except Exception:
+            logger.warning("Filesystem notifications unavailable; using 5-second metadata checks")
+        _resident_trigger_mode = watch.mode
+        # Register notifications before capturing the initial baseline.
+        _run_once()
+        while not stop.is_set():
+            if watch.observer is not None and watch.observer.is_alive():
+                ready = watch.wait(stop)
+            else:
+                _resident_trigger_mode = "polling-fallback"
+                ready = not stop.wait(5)
+            if ready:
+                try:
+                    _run_once()
+                except Exception:
+                    logger.exception("Resident synchronization failed")
+    finally:
+        watch.close()
 
 
 def _start_worker(interval_minutes: int) -> None:
-    global _worker
-    _stop_event.clear()
+    global _worker, _stop_event
+    _stop_event = threading.Event()
     _worker = threading.Thread(
-        target=_loop, args=(interval_minutes * 60,),
+        target=_loop, args=(interval_minutes * 60, _stop_event),
         name="wechat-auto-sync", daemon=True,
     )
     _worker.start()
@@ -360,7 +406,7 @@ def restore_on_startup() -> None:
         return
     interval = _clamp_interval(state.get("interval_minutes"))
     _start_worker(interval)
-    logger.info(f"已恢复定时同步：每 {interval} 分钟")
+    logger.info("已恢复常驻事件同步" if low_write.enabled() else f"已恢复定时同步：每 {interval} 分钟")
 
 
 # ------------------------------------------------------------------
@@ -392,7 +438,7 @@ def get_auto_sync_status() -> Dict[str, Any]:
     return {
         "enabled": bool(state.get("enabled")),
         "running": bool(_worker is not None and _worker.is_alive()),
-        "syncing": bool(active),
+        "syncing": bool(active) or (low_write.enabled() and low_write.SYNC_LOCK.locked()),
         # 独立进程与进程内线程都走这条路径：调用方据此区分「正常在跑」与「卡死」
         "sync_mode": active.get("mode"),
         "sync_pid": active.get("pid"),
@@ -401,8 +447,13 @@ def get_auto_sync_status() -> Dict[str, Any]:
         "interval_minutes": _clamp_interval(state.get("interval_minutes")),
         "min_interval_minutes": MIN_INTERVAL_MINUTES,
         "max_interval_minutes": MAX_INTERVAL_MINUTES,
-        "run_count": int(state.get("run_count", 0)),
-        "last_run": state.get("last_run"),
+        "run_count": _resident_run_count if low_write.enabled() else int(state.get("run_count", 0)),
+        "last_run": _resident_last_run if low_write.enabled() else state.get("last_run"),
+        "storage_mode": "memory" if low_write.enabled() else "disk",
+        "trigger_mode": _resident_trigger_mode if low_write.enabled() else "timer",
+        "poll_seconds": 5 if low_write.enabled() and _resident_trigger_mode == "polling-fallback" else None,
+        "verification_seconds": 300 if low_write.enabled() else None,
+        "last_check_at": _resident_last_check_at if low_write.enabled() else None,
         "state_file": str(STATE_FILE),
         "note": "定时同步在 wechat-mcp 进程内运行，随该进程（Snow App）启停；"
                 "开关与间隔已持久化，进程重启后自动恢复。手动同步默认起独立进程"
@@ -519,6 +570,15 @@ def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
     同步也会继续跑完（这是与「进程内线程」的关键区别）。
     """
     global _sync_thread, _sync_started_at
+    if low_write.enabled():
+        with _lock:
+            if (_sync_thread and _sync_thread.is_alive()) or low_write.SYNC_LOCK.locked():
+                return {"started": False, "already_running": True, "mode": "resident"}
+            _sync_started_at = time.time()
+            _sync_thread = threading.Thread(target=_sync_worker, args=(force, redecrypt),
+                                            name="wechat-resident-sync", daemon=True)
+            _sync_thread.start()
+        return {"started": True, "mode": "resident"}
     active = _active_sync()
     if active:
         elapsed = time.time() - float(active.get("started_at") or time.time())

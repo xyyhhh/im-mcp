@@ -310,3 +310,88 @@ def sync_data(force: bool = False) -> dict:
     if warnings:
         result["warnings"] = warnings
     return result
+
+
+class _TrackingCursor(sqlite3.Cursor):
+    """Track authoritative keys while scanning a changed message shard."""
+
+
+def sync_memory_source(source, removed=()):
+    """Apply a validated candidate in one transaction; leave publication to caller."""
+    from .adapters.v4 import sync_v4
+    init_schema()
+    conn = get_connection()
+    try:
+        _migrate_derived_tables(conn)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS message_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16)))),
+                kind TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_events_pending ON message_events(acknowledged,id);
+            CREATE TEMP TABLE affected_sessions(username TEXT PRIMARY KEY);
+            CREATE TEMP TRIGGER track_message_insert AFTER INSERT ON main.messages BEGIN
+                INSERT OR IGNORE INTO affected_sessions VALUES (new.session_username);
+                INSERT INTO message_events(kind,message_id,created_at)
+                    SELECT 'message.created',new.id,CAST(strftime('%s','now') AS INTEGER)
+                    WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
+            END;
+            CREATE TEMP TRIGGER track_message_update AFTER UPDATE ON main.messages BEGIN
+                INSERT OR IGNORE INTO affected_sessions VALUES (old.session_username);
+                INSERT OR IGNORE INTO affected_sessions VALUES (new.session_username);
+                INSERT INTO message_events(kind,message_id,created_at)
+                    SELECT 'message.updated',new.id,CAST(strftime('%s','now') AS INTEGER)
+                    WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
+            END;
+            CREATE TEMP TRIGGER track_message_delete AFTER DELETE ON main.messages BEGIN
+                INSERT OR IGNORE INTO affected_sessions VALUES (old.session_username);
+                INSERT INTO message_events(kind,message_id,created_at)
+                    SELECT 'message.deleted',old.id,CAST(strftime('%s','now') AS INTEGER)
+                    WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
+            END;
+            CREATE TEMP TRIGGER track_session_insert AFTER INSERT ON main.sessions BEGIN
+                INSERT OR IGNORE INTO affected_sessions VALUES (new.username);
+            END;
+        """)
+        conn.execute("BEGIN IMMEDIATE")
+        before = conn.total_changes
+        cur = conn.cursor(factory=_TrackingCursor)
+        cur.seen_messages = set()
+        sync_v4(source.root, cur, source=source)
+        for fn in (sync_media_v4, sync_favorites_v4, sync_emoticons_v4, sync_avatars_v4):
+            fn(source.root, cur, source=source)
+        # Reconcile all keys, rather than a max-ID watermark: edits, recalls,
+        # historical inserts and deletions in a changed shard must be observed.
+        shard_names = {Path(n).name for n in source.selected | set(removed)
+                       if n.startswith("message/")}
+        for name in shard_names:
+            rows = cur.execute("SELECT source_file, session_username, local_id FROM messages WHERE source_file=?",
+                               (name,)).fetchall()
+            missing = [tuple(row) for row in rows if tuple(row) not in cur.seen_messages]
+            cur.executemany("DELETE FROM messages WHERE source_file=? AND session_username=? AND local_id=?", missing)
+        for (username,) in conn.execute("SELECT username FROM affected_sessions").fetchall():
+            count, first = conn.execute(
+                "SELECT COUNT(*), MIN(create_time) FROM messages WHERE session_username=?", (username,)).fetchone()
+            conn.execute("""UPDATE sessions SET message_count=?, first_time=?
+                WHERE username=? AND (message_count IS NOT ? OR first_time IS NOT ?)""",
+                         (count, first, username, count, first))
+        # Repair pre-existing FTS once, not on every polling cycle.
+        row = conn.execute("SELECT value FROM meta WHERE key='fts_rebuilt_version'").fetchone()
+        if not row or row[0] != ETL_SCHEMA_VERSION:
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            conn.execute("INSERT OR REPLACE INTO meta VALUES('fts_rebuilt_version', ?)", (ETL_SCHEMA_VERSION,))
+        changed = conn.total_changes - before
+        conn.execute("INSERT OR IGNORE INTO meta VALUES('events_initialized','1')")
+        conn.commit()
+        return {"status": "success", "changed_rows": changed, **_collect_stats(conn.cursor())}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        source.close()
+        conn.close()
+        release_connections()

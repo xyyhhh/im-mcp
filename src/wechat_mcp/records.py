@@ -18,6 +18,7 @@
 import html
 import re
 import sqlite3
+from .sources import source_exists, connect_source
 from typing import Any, Dict, List, Optional
 
 from .config import get_decrypted_dir
@@ -115,10 +116,10 @@ def find_raw_content(source_file: str, local_id: int, create_time: int) -> Optio
     if not source_file:
         return None
     db_path = get_decrypted_dir() / "message" / source_file
-    if not db_path.exists():
+    if not source_exists(db_path):
         return None
 
-    conn = sqlite3.connect(db_path)
+    conn = connect_source(db_path)
     try:
         conn.row_factory = sqlite3.Row
         tables = [

@@ -16,14 +16,16 @@
 ``images.py`` 的 ``get_message_image`` 保持同一套契约：**返回 file_path，
 由宿主读盘渲染，不走 base64**（避免把图片塞进大模型上下文）。
 
-落盘命名用 ``md5``（同一张头像常被多个 username 共用，天然去重）；``md5``
-缺失时退化为内容 sha1。同名文件已存在且大小一致则跳过写入。
+落盘命名用内容 SHA256（同一张头像常被多个 username 共用，天然去重）。
+同名文件内容一致时跳过写入，旧索引引用的头像也不会被新代次覆盖。
 """
 
 import hashlib
 import logging
 import sqlite3
 from pathlib import Path
+from ..sources import DiskSource
+from .upsert import upsert
 
 from ..config import USER_WECHAT_DIR
 
@@ -54,10 +56,11 @@ def get_avatar_dir() -> Path:
     return USER_WECHAT_DIR / AVATAR_DIR_NAME
 
 
-def sync_avatars_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def sync_avatars_v4(decrypted_dir: Path, cur: sqlite3.Cursor, source=None) -> None:
     """从 head_image.db 建立头像索引并把图片落盘到 ~/.wechat_mcp/avatars/"""
+    source = source or DiskSource()
     head_db = decrypted_dir / "head_image" / "head_image.db"
-    if not head_db.exists():
+    if not source.exists(head_db):
         return
 
     avatar_dir = get_avatar_dir()
@@ -65,7 +68,7 @@ def sync_avatars_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
 
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{head_db}?mode=ro", uri=True)
+        conn = source.connect(head_db)
         conn.row_factory = sqlite3.Row
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "head_image" not in tables:
@@ -102,35 +105,27 @@ def sync_avatars_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 skipped += 1
                 continue
 
-            stem = row["md5"] or hashlib.sha1(buf).hexdigest()
+            stem = hashlib.sha256(buf).hexdigest()
             out_file = avatar_dir / f"{stem}.{fmt}"
-            # 同一 md5 会被多个 username 共用；已存在且大小一致就不重复写盘
-            if not (out_file.exists() and out_file.stat().st_size == len(buf)):
+            # 按内容寻址；内容一致时不重复写盘。
+            if not (out_file.exists() and out_file.read_bytes() == buf):
                 try:
                     out_file.write_bytes(buf)
                     written += 1
                 except OSError as exc:
+                    if source.strict:
+                        raise
                     logger.warning(f"写入头像失败 {out_file}: {exc}")
                     continue
 
-            cur.execute(
-                """
-                INSERT INTO avatars
-                (username, md5, format, size_bytes, file_path, update_time)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO UPDATE SET
-                    md5         = excluded.md5,
-                    format      = excluded.format,
-                    size_bytes  = excluded.size_bytes,
-                    file_path   = excluded.file_path,
-                    update_time = excluded.update_time
-                """,
-                (username, row["md5"] or "", fmt, len(buf), str(out_file), row["update_time"]),
+            upsert(cur, 'avatars', ('username', 'md5', 'format', 'size_bytes', 'file_path', 'update_time'), ('username',), ('?', '?', '?', '?', '?', '?'), (username, row["md5"] or "", fmt, len(buf), str(out_file), row["update_time"]),
             )
             indexed += 1
 
         logger.info(f"Indexed {indexed} avatars ({written} files written, {skipped} skipped)")
     except Exception as exc:
+        if source.strict:
+            raise
         # 头像索引失败不应中断主同步（调用方另有一层 try，这里只负责记录）
         logger.warning(f"Error building avatar index: {exc}")
     finally:

@@ -16,6 +16,8 @@ import logging
 import re
 import sqlite3
 from pathlib import Path
+from ..sources import DiskSource
+from .upsert import upsert, upsert_empty
 
 from ..config import get_files_root
 from ..parser import extract_tag_from_xml
@@ -43,16 +45,17 @@ def _resolve_rel_path(kind: str, chat_hash: str | None, month: str, file_name: s
     return f"msg/file/{month}/{file_name}"
 
 
-def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor, source=None) -> None:
     """从 hardlink.db 建立媒体文件索引（md5 → 文件名 / 磁盘路径）"""
+    source = source or DiskSource()
     hardlink_db = decrypted_dir / "hardlink" / "hardlink.db"
-    if not hardlink_db.exists():
+    if not source.exists(hardlink_db):
         return
 
     files_root = get_files_root()
 
     try:
-        conn = sqlite3.connect(f"file:{hardlink_db}?mode=ro", uri=True)
+        conn = source.connect(hardlink_db)
         conn.row_factory = sqlite3.Row
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -90,6 +93,8 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
             try:
                 rows = conn.execute(f"SELECT {select_cols} FROM {table}").fetchall()
             except sqlite3.Error as exc:
+                if source.strict:
+                    raise
                 logger.warning(f"Error reading {table}: {exc}")
                 continue
 
@@ -108,21 +113,7 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 abs_path = str(Path(files_root) / rel_path) if (files_root and rel_path) else ""
                 # UPSERT on (md5, rel_path)：同一 md5 会出现在多个会话目录下，
                 # 旧主键只取 md5 会让后写入的行覆盖先写入的，丢掉路径
-                cur.execute(
-                    """
-                    INSERT INTO media_files
-                    (md5, kind, file_name, file_size, modify_time, chat_hash, month, rel_path, abs_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(md5, rel_path) DO UPDATE SET
-                        kind        = excluded.kind,
-                        file_name   = excluded.file_name,
-                        file_size   = excluded.file_size,
-                        modify_time = excluded.modify_time,
-                        chat_hash   = excluded.chat_hash,
-                        month       = excluded.month,
-                        abs_path    = excluded.abs_path
-                    """,
-                    (
+                upsert(cur, 'media_files', ('md5', 'kind', 'file_name', 'file_size', 'modify_time', 'chat_hash', 'month', 'rel_path', 'abs_path'), ('md5', 'rel_path'), ('?', '?', '?', '?', '?', '?', '?', '?', '?'), (
                         md5,
                         kind,
                         row["file_name"],
@@ -138,6 +129,8 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         conn.close()
         logger.info(f"Indexed {count} media files")
     except Exception as exc:
+        if source.strict:
+            raise
         logger.warning(f"Error building media index: {exc}")
     finally:
         # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
@@ -152,14 +145,15 @@ def _extract_tag(xml_text: str, tag: str) -> str:
     return extract_tag_from_xml(xml_text or "", tag)
 
 
-def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor, source=None) -> None:
     """从 favorite.db 同步收藏条目（标题 / 描述 / 来源）"""
+    source = source or DiskSource()
     fav_db = decrypted_dir / "favorite" / "favorite.db"
-    if not fav_db.exists():
+    if not source.exists(fav_db):
         return
 
     try:
-        conn = sqlite3.connect(f"file:{fav_db}?mode=ro", uri=True)
+        conn = source.connect(fav_db)
         conn.row_factory = sqlite3.Row
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "fav_db_item" not in tables:
@@ -176,13 +170,7 @@ def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
             if not title:
                 # 图片 / 链接等类型的收藏没有 <title>，退化为描述摘要或类型占位
                 title = desc[:40] if desc else f"[收藏类型 {row['type']}]"
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO favorites
-                (local_id, type, update_time, title, description, from_user, raw_content)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
+            upsert(cur, 'favorites', ('local_id', 'type', 'update_time', 'title', 'description', 'from_user', 'raw_content'), ('local_id',), ('?', '?', '?', '?', '?', '?', '?'), (
                     row["local_id"],
                     row["type"],
                     row["update_time"],
@@ -196,6 +184,8 @@ def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         conn.close()
         logger.info(f"Synced {count} favorites")
     except Exception as exc:
+        if source.strict:
+            raise
         logger.warning(f"Error syncing favorites: {exc}")
     finally:
         # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
@@ -205,14 +195,15 @@ def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
             pass
 
 
-def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor, source=None) -> None:
     """从 emoticon.db 建立表情包索引（md5 → 文字说明 / 所属表情包）"""
+    source = source or DiskSource()
     emo_db = decrypted_dir / "emoticon" / "emoticon.db"
-    if not emo_db.exists():
+    if not source.exists(emo_db):
         return
 
     try:
-        conn = sqlite3.connect(f"file:{emo_db}?mode=ro", uri=True)
+        conn = source.connect(emo_db)
         conn.row_factory = sqlite3.Row
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -236,13 +227,7 @@ def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 if not row["md5"]:
                     continue
                 product_id = row["product_id"] or ""
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO emoticons
-                    (md5, caption, package_id, package_name, kind, thumb_url, cdn_url, designer_id)
-                    VALUES (?, ?, ?, ?, 'non_store', ?, ?, ?)
-                    """,
-                    (
+                upsert(cur, 'emoticons', ('md5', 'caption', 'package_id', 'package_name', 'kind', 'thumb_url', 'cdn_url', 'designer_id'), ('md5',), ('?', '?', '?', '?', 'non_store', '?', '?', '?'), (
                         row["md5"],
                         row["caption"] or "",
                         product_id,
@@ -264,17 +249,7 @@ def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 # 非破坏性 UPSERT：同一 md5 可能已由 kNonStoreEmoticonTable 写入
                 # （带 kind='non_store' 与 thumb/cdn/designer）。原 INSERT OR REPLACE
                 # 会把整行覆盖成 kind='store' 并清空这些 URL 字段。
-                cur.execute(
-                    """
-                    INSERT INTO emoticons
-                    (md5, caption, package_id, package_name, kind, thumb_url, cdn_url, designer_id)
-                    VALUES (?, ?, ?, ?, 'store', '', '', '')
-                    ON CONFLICT(md5) DO UPDATE SET
-                        caption = CASE WHEN emoticons.caption = '' THEN excluded.caption ELSE emoticons.caption END,
-                        package_id = CASE WHEN emoticons.package_id = '' THEN excluded.package_id ELSE emoticons.package_id END,
-                        package_name = CASE WHEN emoticons.package_name = '' THEN excluded.package_name ELSE emoticons.package_name END
-                    """,
-                    (
+                upsert_empty(cur, 'emoticons', ('md5', 'caption', 'package_id', 'package_name', 'kind', 'thumb_url', 'cdn_url', 'designer_id'), ('md5',), ('?', '?', '?', '?', 'store', '', '', ''), (
                         row["md5_"],
                         row["caption_"] or "",
                         row["package_id_"] or "",
@@ -286,6 +261,8 @@ def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         conn.close()
         logger.info(f"Indexed {count} emoticons")
     except Exception as exc:
+        if source.strict:
+            raise
         logger.warning(f"Error building emoticon index: {exc}")
     finally:
         # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
