@@ -74,6 +74,7 @@ APPMSG_LABELS = {
     36: "视频号",
     57: "引用",
     62: "拍一拍",
+    87: "群公告",
 }
 
 def type_label(local_type) -> str:
@@ -135,6 +136,24 @@ def extract_tag_from_xml(xml_text: str, tag: str) -> str:
 def extract_title_from_xml(xml_text: str) -> str:
     """从 appmsg XML 中提取 <title> 内容"""
     return extract_tag_from_xml(xml_text, "title")
+
+
+def _announcement_text(xml_text: str) -> str:
+    """Read announcement text without exposing attachment metadata or URLs."""
+    text = extract_tag_from_xml(xml_text, "textannouncement")
+    if text:
+        return text
+    # Rich announcements can embed a group_notice_item inside CDATA. Only
+    # text dataitems carry a readable body; attachment items contain metadata.
+    notice = extract_tag_from_xml(xml_text, "announcement")
+    parts = []
+    for match in re.finditer(rf"<dataitem\b({_ATTRS})>(.*?)</dataitem>", notice, re.DOTALL):
+        if not re.search(r'''\bdatatype\s*=\s*["']1["']''', match.group(1)):
+            continue
+        value = extract_tag_from_xml(match.group(2), "datadesc")
+        if value:
+            parts.append(value)
+    return "\n".join(parts)
 
 def _summarize_quoted(quoted: str) -> str:
     """被引用的消息本身若是 appmsg，其 <content> 里嵌的是整段原始 XML。
@@ -218,6 +237,12 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
     sub_label = APPMSG_LABELS.get(app_type, "消息")
 
     if xml_text:
+        # Announcement payloads have no title in newer clients. The readable
+        # text is in textannouncement or nested text items instead.
+        if app_type in (25, 87):
+            announcement = _announcement_text(xml_text)
+            if announcement:
+                return f"[群公告] {announcement}"
         # 引用消息：<title> 是本次回复内容，<refermsg> 里才是被引用原文与作者
         if app_type == 57:
             reply = extract_tag_from_xml(xml_text, "title")
