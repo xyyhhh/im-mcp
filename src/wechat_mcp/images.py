@@ -25,29 +25,87 @@ _V1_MAGIC_FULL = b"\x07\x08V1\x08\x07"
 # V1 的 AES 密钥是全局固定常量（过渡期格式，不随账号变化），
 # 与 V2 的账号级密钥不同 —— 因此 V1 无需 image_aes_key 也能离线解密。
 _V1_FIXED_KEY = b"cfcd208495d565ef"
+MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_INLINE_IMAGE_PIXELS = 40_000_000
 
 
-def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]:
-    """Search for image .dat file matching md5 under WeChat storage directories."""
+def _find_image_candidates(md5: str, search_roots: list[Path]) -> list[Path]:
+    """Highest-quality local variants first; never mistake a thumbnail for full size."""
     if not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
-        return None
+        return []
+    names = [f"{md5}{suffix}.dat" for suffix in ("_h", "_h_W", "", "_W", "_t", "_t_W")]
+    ranks = {name: index for index, name in enumerate(names)}
     for root in search_roots:
         if not root.exists():
             continue
         attach_dir = root / "msg" / "attach"
         if attach_dir.exists():
-            matches = [p for p in attach_dir.glob(f"**/{md5}*.dat") if p.is_file()]
+            matches = [
+                p
+                for p in attach_dir.glob(f"**/{md5}*.dat")
+                if p.is_file() and p.name in ranks
+            ]
             if matches:
-                # Prioritize non-thumbnail if available, else thumbnail
-                return sorted(
-                    matches,
-                    key=lambda p: (
-                        p.name.endswith(("_t.dat", "_t_W.dat")),
-                        p.name != f"{md5}.dat",
-                        str(p),
-                    ),
-                )[0]
-    return None
+                return sorted(matches, key=lambda p: (ranks[p.name], str(p)))
+    return []
+
+
+def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]:
+    matches = _find_image_candidates(md5, search_roots)
+    return matches[0] if matches else None
+
+
+def image_dimensions(data: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Read dimensions without decoding pixels or adding an imaging dependency."""
+    if (
+        data.startswith(b"\x89PNG\r\n\x1a\n")
+        and data[12:16] == b"IHDR"
+        and len(data) >= 24
+    ):
+        return struct.unpack(">II", data[16:24])
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+    if data.startswith(b"\xff\xd8"):
+        offset = 2
+        while offset + 4 <= len(data):
+            if data[offset] != 0xFF:
+                break
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in (0xD9, 0xDA):
+                break
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                continue
+            size = int.from_bytes(data[offset : offset + 2], "big")
+            if size < 2 or offset + size > len(data):
+                break
+            if (
+                marker
+                in (
+                    0xC0,
+                    0xC1,
+                    0xC2,
+                    0xC3,
+                    0xC5,
+                    0xC6,
+                    0xC7,
+                    0xC9,
+                    0xCA,
+                    0xCB,
+                    0xCD,
+                    0xCE,
+                    0xCF,
+                )
+                and size >= 8
+            ):
+                height, width = struct.unpack(">HH", data[offset + 3 : offset + 7])
+                return width, height
+            offset += size
+    return None, None
 
 
 def _save_mirrored_image(
@@ -337,7 +395,10 @@ def _try_extract_image_key(max_seconds: float = 20.0) -> bool:
 
 
 def get_image_for_message(
-    message_id: int, include_base64: bool = False
+    message_id: int,
+    include_base64: bool = False,
+    quality: str = "full",
+    allow_large: bool = False,
 ) -> Dict[str, Any]:
     """
     Resolve and decrypt an image for a specific message ID.
@@ -346,6 +407,12 @@ def get_image_for_message(
     import sqlite3
     from .sources import source_exists, connect_source
     from .database import get_connection
+
+    if quality not in {"full", "thumbnail"}:
+        return {
+            "error": "quality must be full or thumbnail",
+            "error_code": "invalid_quality",
+        }
 
     conn = get_connection()
     conn.row_factory = sqlite3.Row
@@ -452,53 +519,61 @@ def get_image_for_message(
         except Exception:
             pass
 
-    dat_file = _find_image_dat_by_md5(target_md5, candidates)
-    if not dat_file:
+    variants = _find_image_candidates(target_md5, candidates)
+    if not variants:
         return {
             "error": "Image is not present in local WeChat storage; open it in WeChat to download it.",
             "error_code": "image_not_downloaded",
             "md5": target_md5,
         }
 
-    # 3. Decrypt（缺 V2 密钥时先自动尝试一次内存提取，见 _try_extract_image_key）
-    image_aes_key = _load_image_key(all_keys_path)
-    img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
-
-    if err and "image_aes_key" in err and _try_extract_image_key():
-        # 自动提取成功：密钥已落盘，重读并重试一次
-        image_aes_key = _load_image_key(all_keys_path)
-        img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
-
-    if err:
+    is_thumb = lambda path: path.name.endswith(("_t.dat", "_t_W.dat"))
+    available_thumbnail = any(is_thumb(path) for path in variants)
+    selected = [path for path in variants if is_thumb(path) == (quality == "thumbnail")]
+    if not selected:
         return {
-            "error": err,
+            "error": "Requested image quality has not been downloaded locally. Open the full image in WeChat first.",
             "error_code": (
+                "original_not_downloaded"
+                if quality == "full"
+                else "thumbnail_not_downloaded"
+            ),
+            "available_thumbnail": available_thumbnail,
+        }
+
+    # Try every requested-quality variant before reporting a decoder failure.
+    # A wxgf normal variant must never hide an available high-resolution JPEG.
+    image_aes_key = _load_image_key(all_keys_path)
+    failures = []
+    for dat_file in selected:
+        img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
+        if err and "image_aes_key" in err and _try_extract_image_key():
+            image_aes_key = _load_image_key(all_keys_path)
+            img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
+        if err:
+            failures.append(
                 "image_key_missing"
                 if "image_aes_key" in err
                 else "image_decryption_failed"
-            ),
-            "md5": target_md5,
-            "dat_path": str(dat_file),
-            "hint": "If this is a WeChat 4.x V2 image, please open 1-2 images in WeChat client to load the key into memory, then run image key extraction.",
-        }
-
-    # 3.5 原图若是 wxgf 私有容器（内含 HEVC，需微信原生解码器才能出图，宿主无法直接渲染），
-    #     回退到同目录的 <md5>_t.dat 缩略图 —— 它是可直接渲染的 JPEG。
-    is_thumbnail = dat_file.name.endswith(("_t.dat", "_t_W.dat"))
-    if img_bytes[:4] == b"wxgf":
-        _save_mirrored_image(dat_file, candidates, img_bytes, fmt)
-        thumb = _find_thumbnail_sibling(dat_file)
-        if thumb is not None:
-            t_bytes, t_fmt, t_err = decrypt_image_dat(thumb, aes_key=image_aes_key)
-            if not t_err and t_bytes[:3] == b"\xff\xd8\xff":
-                img_bytes, fmt = t_bytes, (t_fmt or "jpg")
-                dat_file = thumb
-                is_thumbnail = True
-
-    if fmt not in {"jpg", "png", "gif", "webp"}:
+            )
+            continue
+        if fmt == "wxgf":
+            _save_mirrored_image(dat_file, candidates, img_bytes, fmt)
+        if fmt not in {"jpg", "png", "gif", "webp"}:
+            failures.append("unsupported_image_format")
+            continue
+        break
+    else:
+        code = (
+            "unsupported_image_format"
+            if "unsupported_image_format" in failures
+            else failures[0]
+        )
         return {
-            "error": "Original image uses an unsupported format and no readable thumbnail is available.",
-            "error_code": "unsupported_image_format",
+            "error": "No requested-quality variant can be decoded. A thumbnail was not substituted.",
+            "error_code": code,
+            "available_thumbnail": available_thumbnail,
+            "hint": "Open/download the original in WeChat. Thumbnail retrieval requires quality=thumbnail explicitly.",
         }
 
     # 4. Save decrypted image to cache
@@ -512,14 +587,39 @@ def get_image_for_message(
         "size_bytes": len(img_bytes),
         "file_path": str(out_file),
         "mime_type": "image/jpeg" if fmt == "jpg" else "image/" + fmt,
-        "is_thumbnail": is_thumbnail,
+        "is_thumbnail": is_thumb(dat_file),
+        "quality": quality,
+        "source_variant": (
+            "thumbnail"
+            if is_thumb(dat_file)
+            else "high" if dat_file.name.endswith(("_h.dat", "_h_W.dat")) else "normal"
+        ),
     }
-    if is_thumbnail:
+    width, height = image_dimensions(img_bytes)
+    res.update(width=width, height=height)
+    if failures:
+        res["warning"] = (
+            "A higher-priority full-size variant could not be decoded; this is the best readable local full-size variant."
+        )
+    if res["is_thumbnail"]:
         res["warning"] = (
             "Only a thumbnail is available for viewing; small text may be unreadable. Do not infer uncertain names or dates."
         )
 
     if include_base64:
+        if not allow_large and (
+            len(img_bytes) > MAX_INLINE_IMAGE_BYTES
+            or (width and height and width * height > MAX_INLINE_IMAGE_PIXELS)
+        ):
+            res.update(
+                success=False,
+                error="Image exceeds the normal full-image transfer limit; no thumbnail was substituted.",
+                error_code="image_too_large",
+                limit_bytes=MAX_INLINE_IMAGE_BYTES,
+                limit_pixels=MAX_INLINE_IMAGE_PIXELS,
+                hint="Inspect metadata or explicitly set allow_large=true (decoder hard limit: 64 MiB).",
+            )
+            return res
         res["base64"] = base64.b64encode(img_bytes).decode("ascii")
 
     return res

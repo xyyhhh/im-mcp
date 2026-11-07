@@ -6,7 +6,7 @@ import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
@@ -846,23 +846,28 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
 
 @mcp.tool()
 @_db_tool
-def get_message_image(message_id: int, include_base64: bool = False, return_image: bool = True) -> CallToolResult:
+def get_message_image(message_id: int, include_base64: bool = False, return_image: bool = True,
+                      quality: Literal["full", "thumbnail"] = "full", allow_large: bool = False) -> CallToolResult:
     """获取并解密指定消息关联的聊天图片。
     
     当消息正文为 [图片]、需要读取表格/通知时，用消息 id 调用本工具。
     默认直接返回标准 MCP 图片内容，远程客户端无需访问服务端文件系统。
-    结果会标明是否为缩略图；若文字无法辨认，不要猜测日期或姓名。
+    默认发送本地最高质量的完整图片：优先大图，再尝试普通图，绝不自动回退缩略图。
+    超过 20 MiB 或 4000 万像素时返回明确错误；需要时可显式允许大图传输。
     
     Args:
         message_id: 消息 ID（来自 search_wechat_messages 或 get_messages_by_date 返回的 id 字段）
         include_base64: 兼容旧客户端，在结构化元数据中附带 base64（通常无需开启）
         return_image: 是否返回供视觉模型读取的图片内容（默认 True）；False 只取元数据
+        quality: 默认 full；只有明确需要缩略图时才传 thumbnail
+        allow_large: 允许超过常规传输限制（默认 False，解码仍受 64 MiB 硬上限约束）
     """
     err = _check_db_initialized()
     if err:
         result = {"error": err, "error_code": "index_unavailable"}
     else:
-        result = get_image_for_message(message_id=message_id, include_base64=include_base64 or return_image)
+        result = get_image_for_message(message_id=message_id, include_base64=include_base64 or return_image,
+                                       quality=quality, allow_large=allow_large)
     metadata = dict(result)
     encoded = metadata.get('base64')
     if not include_base64:

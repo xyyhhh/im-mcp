@@ -111,11 +111,14 @@ class ImageFixture(unittest.TestCase):
         )
         self.image.unlink()
         result = images.get_image_for_message(1)
+        self.assertEqual(result["error_code"], "original_not_downloaded")
+        self.assertTrue(result["available_thumbnail"])
+        result = images.get_image_for_message(1, quality="thumbnail")
         self.assertTrue(result["is_thumbnail"])
         self.assertIn("small text", result["warning"])
         self.assertEqual(Path(result["file_path"]).stem, DIGEST + "_t")
 
-    def test_private_container_preserved_and_readable_thumbnail_returned(self):
+    def test_private_container_preserved_without_implicit_thumbnail_fallback(self):
         thumbnail = self.image.with_name(DIGEST + "_t.dat")
         thumbnail.write_bytes(b"fixture")
 
@@ -137,12 +140,67 @@ class ImageFixture(unittest.TestCase):
             ),
         ):
             result = images.get_image_for_message(1)
+            self.assertEqual(result["error_code"], "unsupported_image_format")
+            result = images.get_image_for_message(1, quality="thumbnail")
         self.assertTrue(result["is_thumbnail"])
         self.assertEqual(Path(result["file_path"]).name, DIGEST + "_t.jpg")
         original = self.mirror / self.image.relative_to(self.original).with_suffix(
             ".wxgf"
         )
         self.assertTrue(original.read_bytes().startswith(b"wxgf"))
+
+    def test_high_resolution_preferred_even_when_normal_is_private_container(self):
+        high = self.image.with_name(DIGEST + "_h.dat")
+        high.write_bytes(bytes(b ^ 0x5A for b in PNG + b"full-size-fixture"))
+        self.assertEqual(images._find_image_dat_by_md5(DIGEST, [self.original]), high)
+        # The normal variant would fail to render; it must not shadow the high variant.
+        with patch.object(
+            images, "decrypt_image_dat", wraps=images.decrypt_image_dat
+        ) as decode:
+            result = images.get_image_for_message(1, include_base64=True)
+            self.assertEqual(decode.call_count, 1)
+        self.assertEqual(result["source_variant"], "high")
+        self.assertFalse(result["is_thumbnail"])
+        self.assertEqual(Path(result["file_path"]).stem, DIGEST + "_h")
+        self.assertEqual(base64.b64decode(result["base64"]), PNG + b"full-size-fixture")
+
+    def test_undecodable_high_variant_tries_normal_full_image(self):
+        high = self.image.with_name(DIGEST + "_h.dat")
+        high.write_bytes(b"corrupted-fixture")
+        result = images.get_image_for_message(1)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["source_variant"], "normal")
+        self.assertFalse(result["is_thumbnail"])
+        self.assertIn("higher-priority", result["warning"])
+
+    def test_large_high_image_never_silently_downgrades(self):
+        high = self.image.with_name(DIGEST + "_h.dat")
+        high.write_bytes(bytes(b ^ 0x5A for b in PNG + b"large-fixture"))
+        with patch.object(images, "MAX_INLINE_IMAGE_BYTES", len(PNG)):
+            result = images.get_image_for_message(1, include_base64=True)
+            self.assertEqual(result["error_code"], "image_too_large")
+            self.assertEqual(result["source_variant"], "high")
+            self.assertNotIn("base64", result)
+            metadata = images.get_image_for_message(1)
+            self.assertTrue(metadata["success"])
+            allowed = images.get_image_for_message(
+                1, include_base64=True, allow_large=True
+            )
+            self.assertEqual(
+                base64.b64decode(allowed["base64"]), PNG + b"large-fixture"
+            )
+
+    def test_pixel_limit_detects_small_compressed_large_canvas(self):
+        with patch.object(images, "MAX_INLINE_IMAGE_PIXELS", 0):
+            result = images.get_image_for_message(1, include_base64=True)
+        self.assertEqual(result["error_code"], "image_too_large")
+        self.assertEqual((result["width"], result["height"]), (1, 1))
+
+    def test_unknown_quality_is_rejected(self):
+        self.assertEqual(
+            images.get_image_for_message(1, quality="guess")["error_code"],
+            "invalid_quality",
+        )
 
     def test_mirror_rejects_paths_outside_account(self):
         with self.assertRaises(ValueError):
@@ -210,6 +268,23 @@ class ImageToolResult(unittest.IsolatedAsyncioTestCase):
 
 
 class ImageCipherValidation(unittest.TestCase):
+    def test_header_dimensions(self):
+        self.assertEqual(images.image_dimensions(PNG), (1, 1))
+        self.assertEqual(
+            images.image_dimensions(b"GIF89a" + struct.pack("<HH", 320, 240)),
+            (320, 240),
+        )
+        jpeg = (
+            b"\xff\xd8\xff\xe0\x00\x04ab\xff\xc2\x00\x0b\x08"
+            + struct.pack(">HH", 3000, 4000)
+            + b"\x01\x01\x11\x00"
+        )
+        self.assertEqual(images.image_dimensions(jpeg), (4000, 3000))
+        self.assertEqual(images.image_dimensions(jpeg[:-3]), (None, None))
+        self.assertEqual(
+            images.image_dimensions(b"\xff\xd8\xff\xe0\x00\x00"), (None, None)
+        )
+
     def test_v2_decode_and_wrong_key_rejection(self):
         from Crypto.Cipher import AES
 
