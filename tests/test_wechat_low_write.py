@@ -411,13 +411,39 @@ class TestResidentSync(unittest.TestCase):
         cache = low_write.SnapshotCache()
         state = low_write.scan(self.origin)
         altered = dict(state)
-        altered["message/message_0.db"] = (None, None)
+        altered["fixture-added.db"] = (None, None)
         with patch.object(low_write, "scan", side_effect=[state, altered] * 3):
             with self.assertRaises(RuntimeError):
                 cache.prepare(
                     self.origin, (self.home / "all_keys.json").read_bytes(), self.root
                 )
         self.assertEqual(cache.images, {})
+
+    def test_changing_database_pair_is_retried_and_never_accepted(self):
+        path = self.origin / "message/message_0.db"
+        before = low_write._file_state(path, 96)
+        after = before[:-1] + (b"changed-header",)
+        with patch.object(
+            low_write, "_file_state", side_effect=[before, None, after, None] * 3
+        ):
+            with self.assertRaises(RuntimeError):
+                low_write._capture_database(path)
+
+    def test_unrelated_shard_writes_do_not_require_global_quiescence(self):
+        scan = low_write.scan
+        calls = 0
+
+        def changing_scan(directory):
+            nonlocal calls
+            calls += 1
+            states = scan(directory)
+            if calls % 2 == 0:
+                states["message/message_0.db"] = (None, None)
+            return states
+
+        with patch.object(low_write, "scan", side_effect=changing_scan):
+            self.sync()
+        self.assertEqual(records.find_raw_content("message_0.db", 1, 10), "first")
 
     def test_source_writes_during_decryption_do_not_discard_stable_capture(self):
         decode = low_write.decrypt_image

@@ -182,6 +182,25 @@ def scan(directory):
     }
 
 
+def _capture_database(path):
+    """Require a stable database/WAL pair, without pausing unrelated shards."""
+    wal_path = Path(str(path) + "-wal")
+    for _ in range(3):
+        before = (_file_state(path, 96), _file_state(wal_path, 32))
+        try:
+            encrypted = _read_bounded(path)
+            try:
+                wal = _read_bounded(wal_path)
+            except FileNotFoundError:
+                wal = b""
+        except FileNotFoundError:
+            continue
+        after = (_file_state(path, 96), _file_state(wal_path, 32))
+        if before[0] is not None and before == after:
+            return encrypted, wal, before
+    raise RuntimeError("Database changed during capture; previous snapshot retained")
+
+
 def _read_bounded(path):
     with path.open("rb") as stream:
         data = stream.read(MAX_DATABASE_BYTES + 1)
@@ -229,18 +248,16 @@ class SnapshotCache:
                     raise ValueError(
                         "A source database has no saved key; initialize keys again"
                     )
-                path = directory / name
-                encrypted = _read_bounded(path)
-                wal_path = Path(str(path) + "-wal")
-                try:
-                    wal = _read_bounded(wal_path)
-                except FileNotFoundError:
-                    wal = b""
+                encrypted, wal, state = _capture_database(directory / name)
+                states[name] = state
                 captured[name] = (encrypted, wal, bytes.fromhex(info["enc_key"]))
                 captured_bytes += len(encrypted) + len(wal)
                 if captured_bytes > MAX_SNAPSHOT_BYTES:
                     raise ValueError("Encrypted capture exceeds memory limit")
-            if states == scan(directory):
+            # Different WCDB shards have independent transactions. Their
+            # capture times can differ; only membership must remain stable.
+            # Each captured DB/WAL pair has its own before/after check above.
+            if set(states) == set(scan(directory)):
                 for name in list(captured):
                     encrypted, wal, key = captured.pop(name)
                     images[name] = decoder(encrypted, wal, key)
@@ -340,7 +357,9 @@ def sync_memory(force=False, redecrypt=True):
         # Keep diagnostic details local; source errors can include private data.
         import logging
 
-        logging.getLogger(__name__).debug("Memory sync failed", exc_info=True)
+        logging.getLogger(__name__).warning(
+            "Memory sync failed; previous snapshot retained", exc_info=True
+        )
         return {
             "ok": False,
             "error": type(exc).__name__
