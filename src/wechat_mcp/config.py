@@ -17,7 +17,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # 用户家目录全局持久化路径（与DuangDuang保持一致的设计，杜绝工作目录变动与 uv 缓存清理丢失）
 USER_WECHAT_DIR = Path.home() / ".wechat_mcp"
-DEFAULT_DECRYPTED_DIR = USER_WECHAT_DIR / "decrypted"
+DECRYPTED_FILES_DIR = USER_WECHAT_DIR / "decrypted"
+DEFAULT_DECRYPTED_DIR = DECRYPTED_FILES_DIR / "db_storage"
 DB_PATH = USER_WECHAT_DIR / "app.db"
 
 # 确保家目录存在
@@ -52,11 +53,13 @@ def get_decrypted_dir() -> Path:
     env_dir = os.environ.get("WECHAT_DECRYPTED_DIR")
     if env_dir:
         p = Path(env_dir)
-        if p.exists():
-            return p
+        return p
     # 全局家目录为首选默认路径
-    if DEFAULT_DECRYPTED_DIR.exists() and any(DEFAULT_DECRYPTED_DIR.iterdir()):
+    if DEFAULT_DECRYPTED_DIR.exists():
         return DEFAULT_DECRYPTED_DIR
+    # Continue reading older installations until an explicit migration is made.
+    if DECRYPTED_FILES_DIR.exists() and any(DECRYPTED_FILES_DIR.glob("*/*.db")):
+        return DECRYPTED_FILES_DIR
     # 兼容当前开发目录 / 项目源码下的 decrypted
     plain_dir = BASE_DIR / "decrypted"
     if plain_dir.exists() and any(plain_dir.iterdir()):
@@ -68,6 +71,17 @@ def get_decrypted_dir() -> Path:
     return DEFAULT_DECRYPTED_DIR
 
 
+def get_decrypted_files_root() -> Path:
+    """Account-relative mirror root; db_storage and msg remain siblings."""
+    explicit = os.environ.get("WECHAT_DECRYPTED_FILES_ROOT")
+    if explicit:
+        return Path(explicit)
+    database_dir = get_decrypted_dir()
+    if database_dir.name == "db_storage":
+        return database_dir.parent
+    return DECRYPTED_FILES_DIR
+
+
 def get_files_root() -> Path | None:
     """定位绿泡泡文件根目录（db_storage 的上一级），供媒体文件路径解析使用。
 
@@ -76,9 +90,7 @@ def get_files_root() -> Path | None:
     """
     env_root = os.environ.get("WECHAT_FILES_ROOT")
     if env_root:
-        p = Path(env_root)
-        if p.exists():
-            return p
+        return Path(env_root)
 
     appdata = os.environ.get("APPDATA", "")
     config_dir = Path(appdata) / "Tencent" / "xwechat" / "config"

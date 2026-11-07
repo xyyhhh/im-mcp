@@ -6,14 +6,19 @@ Supports:
 """
 
 import os
-import glob
+import hashlib
 import re
 import struct
 import base64
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
-from .config import BASE_DIR, USER_WECHAT_DIR, get_decrypted_dir
+from .config import (
+    USER_WECHAT_DIR,
+    get_decrypted_dir,
+    get_files_root,
+    get_decrypted_files_root,
+)
 
 _V2_MAGIC_FULL = b"\x07\x08V2\x08\x07"
 _V1_MAGIC_FULL = b"\x07\x08V1\x08\x07"
@@ -21,23 +26,72 @@ _V1_MAGIC_FULL = b"\x07\x08V1\x08\x07"
 # 与 V2 的账号级密钥不同 —— 因此 V1 无需 image_aes_key 也能离线解密。
 _V1_FIXED_KEY = b"cfcd208495d565ef"
 
+
 def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]:
     """Search for image .dat file matching md5 under WeChat storage directories."""
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
+        return None
     for root in search_roots:
         if not root.exists():
             continue
         attach_dir = root / "msg" / "attach"
         if attach_dir.exists():
-            matches = list(attach_dir.glob(f"**/*{md5}*"))
+            matches = [p for p in attach_dir.glob(f"**/{md5}*.dat") if p.is_file()]
             if matches:
                 # Prioritize non-thumbnail if available, else thumbnail
-                full_imgs = [m for m in matches if not m.name.endswith(("_t.dat", "_t_W.dat"))]
-                return full_imgs[0] if full_imgs else matches[0]
-        # Fallback broader search
-        broad = list(root.glob(f"**/*{md5}*.dat"))
-        if broad:
-            return broad[0]
+                return sorted(
+                    matches,
+                    key=lambda p: (
+                        p.name.endswith(("_t.dat", "_t_W.dat")),
+                        p.name != f"{md5}.dat",
+                        str(p),
+                    ),
+                )[0]
     return None
+
+
+def _save_mirrored_image(
+    source: Path, roots: list[Path], data: bytes, fmt: str
+) -> Path:
+    """Preserve account-relative directories and original stem, changing extension only."""
+    if fmt not in {"jpg", "png", "gif", "webp", "wxgf"}:
+        raise ValueError("Unsupported image format")
+    relative = None
+    for root in roots:
+        try:
+            candidate = source.resolve().relative_to(root.resolve())
+        except ValueError:
+            continue
+        if candidate.parts[:2] == ("msg", "attach"):
+            relative = candidate.with_suffix("." + fmt)
+            break
+    if relative is None:
+        raise ValueError("Image is outside the configured account attachment directory")
+    output_root = get_decrypted_files_root().resolve()
+    destination = (output_root / relative).resolve()
+    destination.relative_to(output_root)  # Reject symlink escapes as well.
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if destination.read_bytes() == data:
+            return destination
+    except FileNotFoundError:
+        pass
+    # Atomic replacement: simultaneous readers never receive a partially written image.
+    import tempfile
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
 
 # ---------------------------------------------------------------------------
 # V2 格式的 XOR 段使用**全局单字节**密钥。
@@ -47,12 +101,12 @@ def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]
 #    推出来的密钥是错的，会让整个 XOR 段（图片的绝大部分）变成乱码。
 #    正确做法：从若干 JPEG 缩略图尾部投票推导一次，全局复用。
 # ---------------------------------------------------------------------------
-_XOR_KEY_CACHE: Dict[str, Optional[int]] = {}
+_XOR_KEY_CACHE: Dict[tuple, int] = {}
 
 
 def _detect_xor_key(img_dir: Path, aes_key: bytes) -> Optional[int]:
     """从同目录的 JPEG 缩略图（明文尾必为 FF D9）投票推导全局 XOR 密钥。"""
-    cache_key = str(img_dir)
+    cache_key = (str(img_dir), hashlib.sha256(aes_key).digest())
     if cache_key in _XOR_KEY_CACHE:
         return _XOR_KEY_CACHE[cache_key]
 
@@ -84,7 +138,8 @@ def _detect_xor_key(img_dir: Path, aes_key: bytes) -> Optional[int]:
         votes[k] = votes.get(k, 0) + 1
 
     result = max(votes, key=votes.get) if votes else None
-    _XOR_KEY_CACHE[cache_key] = result
+    if result is not None:
+        _XOR_KEY_CACHE[cache_key] = result
     return result
 
 
@@ -102,13 +157,17 @@ def _find_thumbnail_sibling(dat_path: Path) -> Optional[Path]:
     return None
 
 
-def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[Optional[bytes], str, Optional[str]]:
+def decrypt_image_dat(
+    dat_path: Path, aes_key: Optional[bytes] = None
+) -> Tuple[Optional[bytes], str, Optional[str]]:
     """
     Decrypt a WeChat .dat image file.
     Returns: (decrypted_bytes, format_ext, error_message)
     """
     if not dat_path.exists():
         return None, "", f"Image dat file not found: {dat_path}"
+    if dat_path.stat().st_size > 64 * 1024 * 1024:
+        return None, "", "Image exceeds the 64 MiB decoding limit"
 
     with open(dat_path, "rb") as fp:
         data = fp.read()
@@ -124,8 +183,12 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
             # V1 用固定密钥即可解，不该因为缺 image_aes_key 而失败
             aes_key = _V1_FIXED_KEY
         if not aes_key:
-            return None, "", "WeChat 4.x V2 image encryption requires image_aes_key (not currently loaded)"
-        
+            return (
+                None,
+                "",
+                "WeChat 4.x V2 image encryption requires image_aes_key (not currently loaded)",
+            )
+
         try:
             from Crypto.Cipher import AES
         except ImportError:
@@ -136,8 +199,12 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
 
         aes_size, xor_size = struct.unpack("<II", data[6:14])
         # PKCS7 aligned size
-        aligned_aes_size = aes_size + (16 - aes_size % 16) if aes_size % 16 != 0 else aes_size + 16
-        
+        aligned_aes_size = (
+            aes_size + (16 - aes_size % 16) if aes_size % 16 != 0 else aes_size + 16
+        )
+        if 15 + aligned_aes_size + xor_size > len(data):
+            return None, "", "Corrupted image segment lengths"
+
         cipher_part = data[15 : 15 + aligned_aes_size]
         if len(cipher_part) < aligned_aes_size:
             return None, "", "Corrupted V2 dat file (truncated AES payload)"
@@ -147,15 +214,19 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
             dec_aes = cipher.decrypt(cipher_part)
             # Remove PKCS7 padding
             pad_len = dec_aes[-1]
-            if 1 <= pad_len <= 16:
-                dec_aes = dec_aes[:-pad_len]
+            if (
+                not 1 <= pad_len <= 16
+                or dec_aes[-pad_len:] != bytes([pad_len]) * pad_len
+            ):
+                return None, "", "Invalid image padding; key may be incorrect"
+            dec_aes = dec_aes[:-pad_len]
         except Exception as e:
             return None, "", f"AES decryption failed: {e}"
 
         # Tail XOR
         raw_mid = data[15 + aligned_aes_size : len(data) - xor_size]
         tail_xor = data[len(data) - xor_size :]
-        
+
         if tail_xor:
             # XOR 密钥是**全局单字节**：优先从同目录 JPEG 缩略图投票推导
             # （对 PNG/GIF/WebP 也正确）；推不出来才退回老行为
@@ -230,6 +301,7 @@ def _load_image_key(keys_path: Path) -> Optional[bytes]:
     """从密钥文件读取 image_aes_key（缺失 / 损坏时返回 None）。"""
     try:
         import json
+
         if not keys_path.exists():
             return None
         with open(keys_path, "r", encoding="utf-8") as f:
@@ -248,12 +320,25 @@ def _try_extract_image_key(max_seconds: float = 20.0) -> bool:
     _AUTO_IMAGE_KEY_ATTEMPTED = True
     try:
         from .tools.key_tool import extract_image_key
-        return bool(extract_image_key(max_seconds=max_seconds).get("ok"))
+
+        root = get_files_root()
+        db_dir = os.environ.get("WECHAT_DB_DIR") or (
+            str(root / "db_storage") if root else None
+        )
+        return bool(
+            extract_image_key(
+                db_dir=db_dir,
+                keys_file=str(USER_WECHAT_DIR / "all_keys.json"),
+                max_seconds=max_seconds,
+            ).get("ok")
+        )
     except Exception:  # noqa: BLE001 - 自动提取失败不影响正常错误上报
         return False
 
 
-def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict[str, Any]:
+def get_image_for_message(
+    message_id: int, include_base64: bool = False
+) -> Dict[str, Any]:
     """
     Resolve and decrypt an image for a specific message ID.
     Returns dictionary with image path, metadata, and optional base64 content.
@@ -266,82 +351,92 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     row = cur.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    conn.close()
     if not row:
-        conn.close()
-        return {"error": f"Message id {message_id} not found"}
+        return {"error": "Message not found", "error_code": "message_not_found"}
 
-    if row["local_type"] != 3 and not (row["content"] and "[图片]" in row["content"]):
-        conn.close()
-        return {"error": f"Message id {message_id} is not an image message (local_type={row['local_type']})"}
+    if (row["local_type"] & 0xFFFFFFFF) != 3:
+        return {
+            "error": "The requested message is not an image",
+            "error_code": "not_image",
+        }
 
     source_file = row["source_file"]
     local_id = row["local_id"]
     create_time = row["create_time"]
     decrypted_dir = get_decrypted_dir()
-    
+
     # 1. Try to find image MD5
     target_md5 = None
-    
-    # Attempt A: Check message_resource.db
-    res_db = decrypted_dir / "message" / "message_resource.db"
-    if source_exists(res_db):
-        try:
-            r_conn = connect_source(res_db)
-            r_cur = r_conn.cursor()
-            res_row = r_cur.execute(
-                "SELECT packed_info FROM MessageResourceInfo WHERE message_create_time = ? AND message_local_id = ?",
-                (create_time, local_id)
-            ).fetchone()
-            if res_row and res_row[0]:
-                m = re.search(rb"[0-9a-fA-F]{32}", res_row[0])
-                if m:
-                    target_md5 = m.group(0).decode("ascii").lower()
-            r_conn.close()
-        except Exception:
-            pass
 
-    # Attempt B: Check specific Msg table if target_md5 still not found
-    if not target_md5 and source_file:
+    # Prefer the exact source row. local_id can collide across chat tables.
+    from contextlib import closing
+
+    if source_file and Path(source_file).name == source_file:
         src_db = decrypted_dir / "message" / source_file
         if source_exists(src_db):
             try:
-                s_conn = connect_source(src_db)
-                s_cur = s_conn.cursor()
-                # Find matching table
-                tables = [r[0] for r in s_cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() if r[0].startswith("Msg_")]
-                for tbl in tables:
-                    m_row = s_cur.execute(f"SELECT packed_info_data FROM {tbl} WHERE local_id = ?", (local_id,)).fetchone()
+                with closing(connect_source(src_db)) as s_conn:
+                    tbl = (
+                        "Msg_"
+                        + hashlib.md5(row["session_username"].encode()).hexdigest()
+                    )
+                    m_row = s_conn.execute(
+                        f'SELECT packed_info_data FROM "{tbl}" WHERE local_id = ? AND create_time = ?',
+                        (local_id, create_time),
+                    ).fetchone()
                     if m_row and m_row[0]:
-                        m = re.search(rb"[0-9a-fA-F]{32}", m_row[0])
-                        if m:
-                            target_md5 = m.group(0).decode("ascii").lower()
-                            break
-                s_conn.close()
-            except Exception:
+                        match = re.search(rb"[0-9a-fA-F]{32}", m_row[0])
+                        if match:
+                            target_md5 = match.group(0).decode("ascii").lower()
+            except sqlite3.Error:
                 pass
 
-    conn.close()
+    res_db = decrypted_dir / "message" / "message_resource.db"
+    if not target_md5 and source_exists(res_db):
+        try:
+            with closing(connect_source(res_db)) as r_conn:
+                matches = r_conn.execute(
+                    "SELECT packed_info FROM MessageResourceInfo WHERE message_create_time = ? AND message_local_id = ?",
+                    (create_time, local_id),
+                ).fetchall()
+                md5s = set()
+                for resource in matches:
+                    match = re.search(rb"[0-9a-fA-F]{32}", resource[0] or b"")
+                    if match:
+                        md5s.add(match.group(0).decode("ascii").lower())
+                if len(md5s) == 1:
+                    target_md5 = md5s.pop()
+        except sqlite3.Error:
+            pass
 
     if not target_md5:
-        return {"error": f"Could not locate image metadata or MD5 for message {message_id}"}
+        return {
+            "error": "Could not locate image metadata",
+            "error_code": "metadata_not_found",
+        }
 
     # 2. Search physical dat file
     # Look into possible WeChat root paths
-    candidates = [
-        USER_WECHAT_DIR,
-        Path.home() / "Documents" / "WeChat Files",
-        Path(os.environ.get("APPDATA", "")) / "Tencent" / "WeChat",
-    ]
+    configured_root = get_files_root()
+    candidates = (
+        [configured_root]
+        if configured_root
+        else [
+            Path.home() / "Documents" / "WeChat Files",
+            Path(os.environ.get("APPDATA", "")) / "Tencent" / "WeChat",
+        ]
+    )
     # Check if we can auto-detect from config ini
     try:
         from .tools.key_tool import auto_detect_db_dir
-        db_dir = auto_detect_db_dir()
+
+        db_dir = None if configured_root else auto_detect_db_dir()
         if db_dir:
             # db_dir is like .../xwechat_files/<user_hash>/db_storage
             # parent is xwechat_files/<user_hash>
             user_root = Path(db_dir).parent
             candidates.insert(0, user_root)
-            candidates.insert(1, user_root.parent)
     except Exception:
         pass
 
@@ -349,9 +444,10 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     if all_keys_path.exists():
         try:
             import json
+
             with open(all_keys_path, "r", encoding="utf-8") as f:
                 k_data = json.load(f)
-                if "wechat_dir" in k_data and k_data["wechat_dir"]:
+                if not configured_root and k_data.get("wechat_dir"):
                     candidates.insert(0, Path(k_data["wechat_dir"]))
         except Exception:
             pass
@@ -359,8 +455,9 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     dat_file = _find_image_dat_by_md5(target_md5, candidates)
     if not dat_file:
         return {
-            "error": f"Image file for MD5 {target_md5} not found in local WeChat storage. It may have been cleaned by WeChat or not downloaded yet.",
-            "md5": target_md5
+            "error": "Image is not present in local WeChat storage; open it in WeChat to download it.",
+            "error_code": "image_not_downloaded",
+            "md5": target_md5,
         }
 
     # 3. Decrypt（缺 V2 密钥时先自动尝试一次内存提取，见 _try_extract_image_key）
@@ -375,26 +472,37 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
     if err:
         return {
             "error": err,
+            "error_code": (
+                "image_key_missing"
+                if "image_aes_key" in err
+                else "image_decryption_failed"
+            ),
             "md5": target_md5,
             "dat_path": str(dat_file),
-            "hint": "If this is a WeChat 4.x V2 image, please open 1-2 images in WeChat client to load the key into memory, then run image key extraction."
+            "hint": "If this is a WeChat 4.x V2 image, please open 1-2 images in WeChat client to load the key into memory, then run image key extraction.",
         }
 
     # 3.5 原图若是 wxgf 私有容器（内含 HEVC，需微信原生解码器才能出图，宿主无法直接渲染），
     #     回退到同目录的 <md5>_t.dat 缩略图 —— 它是可直接渲染的 JPEG。
+    is_thumbnail = dat_file.name.endswith(("_t.dat", "_t_W.dat"))
     if img_bytes[:4] == b"wxgf":
+        _save_mirrored_image(dat_file, candidates, img_bytes, fmt)
         thumb = _find_thumbnail_sibling(dat_file)
         if thumb is not None:
             t_bytes, t_fmt, t_err = decrypt_image_dat(thumb, aes_key=image_aes_key)
             if not t_err and t_bytes[:3] == b"\xff\xd8\xff":
                 img_bytes, fmt = t_bytes, (t_fmt or "jpg")
+                dat_file = thumb
+                is_thumbnail = True
+
+    if fmt not in {"jpg", "png", "gif", "webp"}:
+        return {
+            "error": "Original image uses an unsupported format and no readable thumbnail is available.",
+            "error_code": "unsupported_image_format",
+        }
 
     # 4. Save decrypted image to cache
-    output_dir = USER_WECHAT_DIR / "images"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_file = output_dir / f"{message_id}_{target_md5}.{fmt}"
-    with open(out_file, "wb") as fp:
-        fp.write(img_bytes)
+    out_file = _save_mirrored_image(dat_file, candidates, img_bytes, fmt)
 
     res = {
         "success": True,
@@ -403,10 +511,15 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
         "format": fmt,
         "size_bytes": len(img_bytes),
         "file_path": str(out_file),
+        "mime_type": "image/jpeg" if fmt == "jpg" else "image/" + fmt,
+        "is_thumbnail": is_thumbnail,
     }
+    if is_thumbnail:
+        res["warning"] = (
+            "Only a thumbnail is available for viewing; small text may be unreadable. Do not infer uncertain names or dates."
+        )
 
     if include_base64:
         res["base64"] = base64.b64encode(img_bytes).decode("ascii")
 
     return res
-

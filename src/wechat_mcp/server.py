@@ -1,5 +1,6 @@
 import datetime
 import functools
+import json
 import logging
 import re
 import sqlite3
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from .config import DB_PATH, BASE_DIR
 from .database import get_connection, init_schema, release_connections, sync_data
@@ -844,20 +846,33 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
 
 @mcp.tool()
 @_db_tool
-def get_message_image(message_id: int, include_base64: bool = False) -> Dict[str, Any]:
+def get_message_image(message_id: int, include_base64: bool = False, return_image: bool = True) -> CallToolResult:
     """获取并解密指定消息关联的聊天图片。
     
-    优先返回已解密图片的本地物理绝对路径（避免直接将大图 base64 注入大模型导致上下文窗口被撑爆）。
-    如需将图片传递给多模态大模型进行看图分析，可设置 include_base64=True。
+    当消息正文为 [图片]、需要读取表格/通知时，用消息 id 调用本工具。
+    默认直接返回标准 MCP 图片内容，远程客户端无需访问服务端文件系统。
+    结果会标明是否为缩略图；若文字无法辨认，不要猜测日期或姓名。
     
     Args:
         message_id: 消息 ID（来自 search_wechat_messages 或 get_messages_by_date 返回的 id 字段）
-        include_base64: 是否在返回结果中包含图片的 base64 字符串（默认 False）
+        include_base64: 兼容旧客户端，在结构化元数据中附带 base64（通常无需开启）
+        return_image: 是否返回供视觉模型读取的图片内容（默认 True）；False 只取元数据
     """
     err = _check_db_initialized()
     if err:
-        return {"error": err}
-    return get_image_for_message(message_id=message_id, include_base64=include_base64)
+        result = {"error": err, "error_code": "index_unavailable"}
+    else:
+        result = get_image_for_message(message_id=message_id, include_base64=include_base64 or return_image)
+    metadata = dict(result)
+    encoded = metadata.get('base64')
+    if not include_base64:
+        metadata.pop('base64', None)
+    # Do not turn a binary payload into a large text token sequence.
+    text_metadata = {k: v for k, v in metadata.items() if k != 'base64'}
+    content = [TextContent(type='text', text=json.dumps(text_metadata, ensure_ascii=False))]
+    if result.get('success') and return_image:
+        content.append(ImageContent(type='image', data=encoded, mimeType=result['mime_type']))
+    return CallToolResult(content=content, structuredContent=metadata, isError=not result.get('success', False))
 
 
 @mcp.tool()
