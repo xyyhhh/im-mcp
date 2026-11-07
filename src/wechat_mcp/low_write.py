@@ -209,6 +209,9 @@ class SnapshotCache:
             or key_digest != self.key_digest
             or time.monotonic() - self.verified_at >= VERIFY_INTERVAL_SECONDS
         )
+        # Capture encrypted bytes first, then perform CPU-heavy validation on
+        # those immutable buffers. Source writes during decryption belong to
+        # the next generation and must not invalidate an already stable read.
         for attempt in range(3):
             states = scan(directory)
             if not states:
@@ -216,6 +219,8 @@ class SnapshotCache:
             images = {
                 name: data for name, data in self.images.items() if name in states
             }
+            captured = {}
+            captured_bytes = 0
             for name, state in states.items():
                 if not full and self.states.get(name) == state and name in images:
                     continue
@@ -231,10 +236,16 @@ class SnapshotCache:
                     wal = _read_bounded(wal_path)
                 except FileNotFoundError:
                     wal = b""
-                images[name] = decoder(encrypted, wal, bytes.fromhex(info["enc_key"]))
-                if sum(map(len, images.values())) > MAX_SNAPSHOT_BYTES:
-                    raise ValueError("Snapshot exceeds memory limit")
+                captured[name] = (encrypted, wal, bytes.fromhex(info["enc_key"]))
+                captured_bytes += len(encrypted) + len(wal)
+                if captured_bytes > MAX_SNAPSHOT_BYTES:
+                    raise ValueError("Encrypted capture exceeds memory limit")
             if states == scan(directory):
+                for name in list(captured):
+                    encrypted, wal, key = captured.pop(name)
+                    images[name] = decoder(encrypted, wal, key)
+                    if sum(map(len, images.values())) > MAX_SNAPSHOT_BYTES:
+                        raise ValueError("Snapshot exceeds memory limit")
                 changed = {
                     name
                     for name, image in images.items()

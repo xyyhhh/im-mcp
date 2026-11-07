@@ -419,6 +419,29 @@ class TestResidentSync(unittest.TestCase):
                 )
         self.assertEqual(cache.images, {})
 
+    def test_source_writes_during_decryption_do_not_discard_stable_capture(self):
+        decode = low_write.decrypt_image
+        updated = False
+
+        def decoder(encrypted, wal, key):
+            nonlocal updated
+            if not updated:
+                updated = True
+                self.put(
+                    "message/message_0.db",
+                    image_for("message", ((1, "next generation", 10),)),
+                )
+            return decode(encrypted, wal, key)
+
+        with patch.object(low_write, "decrypt_image", side_effect=decoder) as wrapped:
+            self.sync()
+            self.assertEqual(wrapped.call_count, 3)
+        self.assertEqual(records.find_raw_content("message_0.db", 1, 10), "first")
+        self.sync()
+        self.assertEqual(
+            records.find_raw_content("message_0.db", 1, 10), "next generation"
+        )
+
     def test_event_is_not_visible_before_transaction_commit(self):
         self.sync()
         with closing(sqlite3.connect(self.index)) as conn:
