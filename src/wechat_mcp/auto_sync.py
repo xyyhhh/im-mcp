@@ -401,6 +401,11 @@ def _stop_worker() -> None:
 
 def restore_on_startup() -> None:
     """MCP 服务启动时按持久化状态恢复定时器（未开启则什么都不做）"""
+    from .event_push import start_from_environment
+    try:
+        start_from_environment()
+    except Exception:
+        logger.warning("Event delivery configuration unavailable; database sync remains enabled")
     state = _load_state()
     if not state.get("enabled"):
         return

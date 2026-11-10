@@ -30,9 +30,9 @@ Windows 使用 watchdog 的 `ReadDirectoryChangesW` 后端。文件通知可能�
 
 首版仍完整读取、解密一个发生变化的分库，尚未实现跨轮次页级增量解密；优化重点是减少磁盘写入。单个输入文件上限 512 MiB，加密捕获缓冲与明文快照有效负载各自上限 1 GiB；两者会同时存在，SQLite 反序列化和候选代次也会带来额外内存占用。这些上限不是进程 RSS 上限。内存也可能由操作系统换页，不承诺明文绝不落盘。
 
-## 下游事件接口（预留）
+## 下游事件接口
 
-当前没有 HTTP 接收端、webhook、脚本执行器或自动网络发送。只提供进程内 Python 接口，方便后续实现选定的下游适配器：
+默认只提供进程内 Python 接口。可显式配置[持久消息投递适配器](event-push.md)，通过受限 OpenSSH 加密连接调用 Router 接口；未配置时不执行网络发送：
 
 ```python
 from wechat_mcp.events import wait_for_events, acknowledge_events
@@ -45,9 +45,9 @@ for event in batch:
 # acknowledge_events([event["id"] for event in successfully_handled])
 ```
 
-`pending_events(limit)` 提供非阻塞读取；`wait_for_events` 在同一进程内通过通知唤醒，不需要反复查询数据库。跨进程或跨主机接入需要后续适配器。
+`pending_events(limit)` 提供非阻塞读取；`wait_for_events` 在同一进程内通过通知唤醒，不需要反复查询数据库。
 
-事件包含本地递增 `id`、随机唯一 `event_id`、`kind`、`message_id` 和 `created_at`。类型为 `message.created`、`message.updated`、`message.deleted`。不在事件中复制聊天正文、联系人名或源文件路径。查询索引本身仍包含原有明文数据，事件表与其使用同样的访问控制。
+事件包含本地递增 `id`、随机唯一 `event_id`、`kind`、`message_id` 和 `created_at`。类型为 `message.created`、`message.updated`、`message.deleted`。新版还包含 `snapshot`：保存变化时的正文、身份、源库名/局部 ID 和时间，使撤回、删除和重试时仍能还原事件。它属于敏感明文，与查询索引使用同样的访问控制；旧事件的快照可能为空。
 
 初次建立基线不发送整段历史；后续新增记录（包括历史补充）、修改和删除会生成事件。这些是“索引消息变化”，包括本机发送的消息，不能直接等同于“收到一条新消息”；后续适配器需明确会话、方向与历史补充的过滤策略。
 

@@ -323,34 +323,36 @@ def sync_memory_source(source, removed=()):
     conn = get_connection()
     try:
         _migrate_derived_tables(conn)
+        from .events import ensure_schema
+        ensure_schema(conn)
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS message_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16)))),
-                kind TEXT NOT NULL,
-                message_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                acknowledged INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_message_events_pending ON message_events(acknowledged,id);
             CREATE TEMP TABLE affected_sessions(username TEXT PRIMARY KEY);
             CREATE TEMP TRIGGER track_message_insert AFTER INSERT ON main.messages BEGIN
                 INSERT OR IGNORE INTO affected_sessions VALUES (new.session_username);
-                INSERT INTO message_events(kind,message_id,created_at)
-                    SELECT 'message.created',new.id,CAST(strftime('%s','now') AS INTEGER)
+                INSERT INTO message_events(kind,message_id,created_at,snapshot)
+                    SELECT 'message.created',new.id,CAST(strftime('%s','now') AS INTEGER),
+                        json_object('source_file',new.source_file,'local_id',new.local_id,
+                            'session_username',new.session_username,'sender_username',new.sender_username,
+                            'create_time',new.create_time,'local_type',new.local_type,'content',new.content)
                     WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
             END;
             CREATE TEMP TRIGGER track_message_update AFTER UPDATE ON main.messages BEGIN
                 INSERT OR IGNORE INTO affected_sessions VALUES (old.session_username);
                 INSERT OR IGNORE INTO affected_sessions VALUES (new.session_username);
-                INSERT INTO message_events(kind,message_id,created_at)
-                    SELECT 'message.updated',new.id,CAST(strftime('%s','now') AS INTEGER)
+                INSERT INTO message_events(kind,message_id,created_at,snapshot)
+                    SELECT 'message.updated',new.id,CAST(strftime('%s','now') AS INTEGER),
+                        json_object('source_file',new.source_file,'local_id',new.local_id,
+                            'session_username',new.session_username,'sender_username',new.sender_username,
+                            'create_time',new.create_time,'local_type',new.local_type,'content',new.content)
                     WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
             END;
             CREATE TEMP TRIGGER track_message_delete AFTER DELETE ON main.messages BEGIN
                 INSERT OR IGNORE INTO affected_sessions VALUES (old.session_username);
-                INSERT INTO message_events(kind,message_id,created_at)
-                    SELECT 'message.deleted',old.id,CAST(strftime('%s','now') AS INTEGER)
+                INSERT INTO message_events(kind,message_id,created_at,snapshot)
+                    SELECT 'message.deleted',old.id,CAST(strftime('%s','now') AS INTEGER),
+                        json_object('source_file',old.source_file,'local_id',old.local_id,
+                            'session_username',old.session_username,'sender_username',old.sender_username,
+                            'create_time',old.create_time,'local_type',old.local_type,'content',old.content)
                     WHERE EXISTS(SELECT 1 FROM meta WHERE key='events_initialized');
             END;
             CREATE TEMP TRIGGER track_session_insert AFTER INSERT ON main.sessions BEGIN

@@ -313,6 +313,8 @@ class TestResidentSync(unittest.TestCase):
         self.assertEqual(
             [e["kind"] for e in events.pending_events()].count("message.deleted"), 2
         )
+        deletion = next(e for e in events.pending_events() if e['kind']=='message.deleted')
+        self.assertIn(json.loads(deletion['snapshot'])['content'], ('later','history'))
 
     def test_force_identical_rows_does_not_churn_ids_or_events(self):
         self.sync()

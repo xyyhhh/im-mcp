@@ -2,7 +2,7 @@
 
 One logical consumer reads pending events and acknowledges only after its
 downstream operation succeeds. Delivery is at least once; deduplicate by id.
-Event rows contain index IDs, not message text or contact names. An initial
+Event rows retain immutable message snapshots for durable delivery. An initial
 baseline is silent; subsequent changes, including historical imports, emit.
 """
 
@@ -10,6 +10,25 @@ import sqlite3
 import threading
 
 _ready = threading.Event()
+
+
+def ensure_schema(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS message_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16)))),
+            kind TEXT NOT NULL, message_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0,
+            snapshot TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_message_events_pending ON message_events(acknowledged,id);
+    """)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if "snapshot" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(message_events)")
+        }:
+            conn.execute("ALTER TABLE message_events ADD COLUMN snapshot TEXT")
 
 
 def notify_committed():
@@ -41,7 +60,7 @@ def pending_events(limit=100):
         if not exists:
             return []
         rows = conn.execute(
-            """SELECT id, event_id, kind, message_id, created_at FROM message_events
+            """SELECT id, event_id, kind, message_id, created_at, snapshot FROM message_events
             WHERE acknowledged=0 ORDER BY id LIMIT ?""",
             (max(1, min(int(limit), 1000)),),
         ).fetchall()
